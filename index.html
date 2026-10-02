@@ -13,9 +13,7 @@
         <h1 class="text-2xl md:text-3xl font-bold tracking-wider text-amber-400">⚡ 台灣即時地震監控</h1>
         <p class="text-xs text-slate-400 mt-1">資料來源：交通部中央氣象署（顯著有感地震報告）</p>
       </div>
-      <button id="refresh" class="bg-amber-500 hover:bg-amber-600 text-slate-950 font-semibold px-4 py-2 rounded-lg text-sm transition shadow-lg cursor-pointer">
-        重新整理
-      </button>
+      <button id="refresh" class="bg-amber-500 hover:bg-amber-600 text-slate-950 font-semibold px-4 py-2 rounded-lg text-sm transition shadow-lg cursor-pointer">重新整理</button>
     </header>
 
     <div id="loading" class="text-center py-12 text-slate-400">正在向氣象署獲取最新地震資料...</div>
@@ -42,89 +40,197 @@
           <p id="eq-location" class="text-xl font-semibold text-amber-200">--</p>
         </div>
         <div>
-          <h2 class="text-xs text-slate-400 mb-1">詳細描述</h2>
-          <p id="eq-content" class="text-slate-300 leading-relaxed bg-slate-900 p-4 rounded-lg border border-slate-800">--</p>
+          <h2 class="text-xs text-slate-400 mb-2">各縣市震度（只列有震度的縣市，由北到南）</h2>
+          <div id="eq-counties" class="flex flex-wrap gap-2"></div>
+          <p id="eq-counties-warn" class="hidden text-sm text-amber-300 mt-2">沒有解析到縣市震度。請展開下方「原始資料」，把內容貼給協助你的人檢查欄位。</p>
         </div>
         <a id="eq-link" href="#" target="_blank" rel="noopener" class="hidden text-sm text-sky-400 hover:underline">查看氣象署完整報告</a>
       </div>
 
       <div class="bg-slate-800 p-6 rounded-xl border border-slate-700">
-        <h2 class="text-md font-bold mb-3 text-slate-300 border-b border-slate-700 pb-2">近期地震列表</h2>
-        <div id="eq-list" class="space-y-2 text-sm text-slate-400"></div>
+        <h2 class="text-md font-bold mb-3 text-slate-300 border-b border-slate-700 pb-2">通報文字（依所選地震自動帶入，可一鍵複製）</h2>
+        <div id="eq-msgs" class="space-y-4"></div>
       </div>
+
+      <div class="bg-slate-800 p-6 rounded-xl border border-slate-700">
+        <h2 class="text-md font-bold mb-1 text-slate-300 border-b border-slate-700 pb-2">近期地震列表（點選可切換）</h2>
+        <div id="eq-list" class="text-sm text-slate-400"></div>
+      </div>
+
+      <details class="bg-slate-800 p-4 rounded-xl border border-slate-700">
+        <summary class="cursor-pointer text-sm text-slate-400">原始資料（除錯用）</summary>
+        <pre id="eq-raw" class="mt-3 text-xs text-slate-400 overflow-x-auto max-h-80"></pre>
+      </details>
     </div>
   </div>
 
   <script>
-    // 由 Netlify Function 代理，授權碼存在 Netlify 的環境變數，不會出現在前端
     const API_URL = '/.netlify/functions/quake';
-
     const $ = (id) => document.getElementById(id);
+
+    // 縣市顯示順序（北到南、再到東部與外島）
+    const ORDER = ['基隆','台北','新北','桃園','新竹','苗栗','台中','彰化','南投','雲林','嘉義','台南','高雄','屏東','宜蘭','花蓮','台東','澎湖','金門','連江'];
+
+    let reports = [];
+    let current = 0;
+
+    // ---- 震度處理 ----
+    function fmtIntensity(v) {
+      if (v == null || v === '') return null;
+      let s = typeof v === 'object' ? `${v.value ?? v.Value ?? ''}${v.unit ?? v.Unit ?? ''}` : String(v);
+      s = s.trim();
+      if (!s) return null;
+      return /^\d+$/.test(s) ? s + '級' : s;
+    }
+    function rank(s) {
+      const n = parseFloat(s) || 0;
+      return n + (s.includes('弱') ? 0.3 : s.includes('強') ? 0.7 : 0);
+    }
+
+    // 取出「縣市 → 最大震度」，所有有震度(1級以上)的縣市都列出，不含鄉鎮
+    function countyList(report) {
+      const areas = (report && report.Intensity && report.Intensity.ShakingArea) || [];
+      const map = {};
+      areas.forEach((a) => {
+        let inten = fmtIntensity(a.AreaIntensity);
+        if (!inten) {
+          const m = (a.AreaDesc || '').match(/最大震度(\d[弱強]?級?)/);
+          if (m) inten = fmtIntensity(m[1]);
+        }
+        if (!inten) return;
+        const text = [a.CountyName, a.AreaName].filter(Boolean).join('、');
+        (text.match(/[^縣市、,，\s]{2,3}[縣市]/g) || []).forEach((full) => {
+          const name = full.replace(/臺/g, '台').replace(/[縣市]$/, ''); // 新竹縣/市、嘉義縣/市 合併
+          if (!map[name] || rank(inten) > rank(map[name])) map[name] = inten;
+        });
+      });
+      const idx = (n) => (ORDER.indexOf(n) === -1 ? 99 : ORDER.indexOf(n));
+      return Object.entries(map).filter(([, v]) => rank(v) >= 1).sort((a, b) => idx(a[0]) - idx(b[0]));
+    }
+
+    function placeOf(loc) {
+      const m = (loc || '').match(/位於(.+?)\)?\s*$/);
+      return m ? m[1] : loc || '';
+    }
+
+    // ---- 通報文字範本 ----
+    function buildMessages(r) {
+      const i = r.EarthquakeInfo;
+      const t = (i.OriginTime || '').slice(11, 16);
+      const place = placeOf(i.Epicenter && i.Epicenter.Location);
+      const base = `位於：${place}，芮氏規模${i.EarthquakeMagnitude.MagnitudeValue}，深度${i.FocalDepth}公里。`;
+      const list = countyList(r).map(([n, v]) => n + v).join('，');
+      const county = list ? `各縣市最大震度：${list}。` : '';
+      const none = '各地地震偵測器讀數：0 Gal。不影響列車運轉。';
+      const some = '地震偵測器告警未作動，未影響列車運轉。詳細各地震度及地震偵測器讀數資訊稍後補充。';
+      return [
+        ['無讀數｜首封簡訊已發', `OCC：(承${t}地震報告) ${base}${none}${county}`],
+        ['無讀數｜首封簡訊未發', `OCC：行控中心接收到氣象署地震簡訊，發震時間：${t}，${base}${none}副知鐵道局。${county}`],
+        ['無讀數｜OMC 續報', `OCC：行控中心接收到氣象署地震報告，發震時間：${t}，${base}${none}${county}`],
+        ['有讀數｜首封簡訊已發', `OCC：(承${t}地震報告) ${base}${some}`],
+        ['有讀數｜首封簡訊未發', `OCC：行控中心收到氣象署地震簡訊，發震時間：${t}，${base}${some}副知鐵道局。`],
+        ['有讀數｜OMC 續報', `OCC：收到中央氣象署發佈地震報告。發震時間：${t}，${base}${some}`],
+      ];
+    }
+
+    function chipClass(v) {
+      const r = rank(v);
+      if (r >= 5) return 'bg-red-500/20 text-red-300 border-red-500/50';
+      if (r >= 4) return 'bg-amber-500/20 text-amber-300 border-amber-500/50';
+      if (r >= 2) return 'bg-sky-500/20 text-sky-300 border-sky-500/50';
+      return 'bg-slate-700/60 text-slate-300 border-slate-600';
+    }
+
+    // ---- 畫面 ----
+    function render() {
+      const r = reports[current];
+      const i = r.EarthquakeInfo;
+
+      $('eq-mag').textContent = `M ${i.EarthquakeMagnitude.MagnitudeValue}`;
+      $('eq-depth').textContent = i.FocalDepth;
+      $('eq-time').textContent = i.OriginTime;
+      $('eq-location').textContent = i.Epicenter.Location;
+
+      const linkEl = $('eq-link');
+      if (r.Web) { linkEl.href = r.Web; linkEl.classList.remove('hidden'); }
+      else linkEl.classList.add('hidden');
+
+      const counties = countyList(r);
+      const chips = $('eq-counties');
+      chips.innerHTML = '';
+      counties.forEach(([name, v]) => {
+        const s = document.createElement('span');
+        s.className = 'px-3 py-1 rounded-full border text-sm ' + chipClass(v);
+        s.textContent = name + ' ' + v;
+        chips.appendChild(s);
+      });
+      $('eq-counties-warn').classList.toggle('hidden', counties.length > 0);
+
+      const box = $('eq-msgs');
+      box.innerHTML = '';
+      buildMessages(r).forEach(([title, text]) => {
+        const wrap = document.createElement('div');
+        wrap.className = 'bg-slate-900 border border-slate-700 rounded-lg p-3';
+        const head = document.createElement('div');
+        head.className = 'flex justify-between items-center mb-2';
+        const h = document.createElement('span');
+        h.className = 'text-xs font-semibold text-amber-300';
+        h.textContent = title;
+        const btn = document.createElement('button');
+        btn.className = 'text-xs bg-slate-700 hover:bg-slate-600 px-3 py-1 rounded cursor-pointer';
+        btn.textContent = '複製';
+        btn.onclick = async () => {
+          try { await navigator.clipboard.writeText(text); btn.textContent = '已複製'; }
+          catch (e) { btn.textContent = '請手動選取複製'; }
+          setTimeout(() => (btn.textContent = '複製'), 1500);
+        };
+        head.append(h, btn);
+        const p = document.createElement('p');
+        p.className = 'text-sm text-slate-300 leading-relaxed whitespace-pre-wrap';
+        p.textContent = text;
+        wrap.append(head, p);
+        box.appendChild(wrap);
+      });
+
+      const listEl = $('eq-list');
+      listEl.innerHTML = '';
+      reports.slice(0, 8).forEach((eq, idx) => {
+        const x = eq.EarthquakeInfo;
+        const row = document.createElement('button');
+        row.className = 'w-full flex justify-between items-center gap-2 py-2 px-2 border-b border-slate-700/50 text-left cursor-pointer hover:bg-slate-700/40 ' + (idx === current ? 'bg-slate-700/60' : '');
+        [['text-slate-300', x.OriginTime],
+         ['text-amber-400 font-medium whitespace-nowrap', `規模 ${x.EarthquakeMagnitude.MagnitudeValue}`],
+         ['text-slate-400 text-xs truncate max-w-[150px] md:max-w-xs', x.Epicenter.Location]].forEach(([cls, txt]) => {
+          const sp = document.createElement('span');
+          sp.className = cls; sp.textContent = txt; row.appendChild(sp);
+        });
+        row.onclick = () => { current = idx; render(); };
+        listEl.appendChild(row);
+      });
+
+      $('eq-raw').textContent = JSON.stringify(r.Intensity || r, null, 2);
+    }
 
     async function fetchEarthquakeData() {
       const loadingEl = $('loading');
-      const cardEl = $('eq-card');
-
       loadingEl.textContent = '正在更新資料...';
       loadingEl.classList.remove('hidden');
-      cardEl.classList.add('hidden');
-
+      $('eq-card').classList.add('hidden');
       try {
-        const response = await fetch(API_URL);
+        const response = await fetch(API_URL + '?t=' + Date.now());
         if (!response.ok) throw new Error('HTTP ' + response.status);
         const data = await response.json();
-
-        if (data.success === 'false' || !data.records) {
-          throw new Error('API 回應異常，請確認授權碼');
-        }
-
-        const earthquakes = data.records.Earthquake;
-        if (!earthquakes || earthquakes.length === 0) {
-          loadingEl.textContent = '目前沒有查到地震資料。';
-          return;
-        }
-
-        const latest = earthquakes[0];
-        const info = latest.EarthquakeInfo;
-
-        $('eq-mag').textContent = `M ${info.EarthquakeMagnitude.MagnitudeValue}`;
-        $('eq-depth').textContent = info.FocalDepth;
-        $('eq-time').textContent = info.OriginTime;
-        $('eq-location').textContent = info.Epicenter.Location;
-        $('eq-content').textContent = latest.ReportContent || '無詳細描述';
-
-        const linkEl = $('eq-link');
-        if (latest.Web) {
-          linkEl.href = latest.Web;
-          linkEl.classList.remove('hidden');
-        } else {
-          linkEl.classList.add('hidden');
-        }
-
-        const listEl = $('eq-list');
-        listEl.innerHTML = '';
-        earthquakes.slice(0, 5).forEach((eq) => {
-          const i = eq.EarthquakeInfo;
-          const row = document.createElement('div');
-          row.className = 'flex justify-between items-center gap-2 py-2 border-b border-slate-700/50 last:border-0';
-          [
-            ['text-slate-300', i.OriginTime],
-            ['text-amber-400 font-medium whitespace-nowrap', `規模 ${i.EarthquakeMagnitude.MagnitudeValue}`],
-            ['text-slate-400 text-xs truncate max-w-[150px] md:max-w-xs', i.Epicenter.Location],
-          ].forEach(([cls, text]) => {
-            const span = document.createElement('span');
-            span.className = cls;
-            span.textContent = text;
-            row.appendChild(span);
-          });
-          listEl.appendChild(row);
-        });
-
+        if (!data.records) throw new Error('API 回應異常，請確認授權碼');
+        reports = (data.records.Earthquake || []).slice()
+          .sort((a, b) => String(b.EarthquakeInfo.OriginTime).localeCompare(String(a.EarthquakeInfo.OriginTime)));
+        if (!reports.length) { loadingEl.textContent = '目前沒有查到地震資料。'; return; }
+        current = 0;
+        render();
         loadingEl.classList.add('hidden');
-        cardEl.classList.remove('hidden');
+        $('eq-card').classList.remove('hidden');
       } catch (error) {
         console.error('API 抓取失敗:', error);
-        loadingEl.textContent = '抓取地震資料失敗：' + error.message + '（按 F12 看 Console 可得更多資訊）';
+        loadingEl.textContent = '抓取地震資料失敗：' + error.message;
       }
     }
 
