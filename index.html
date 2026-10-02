@@ -56,8 +56,8 @@
   </div>
 
   <script>
-    // 由 Cloudflare Pages Function 代理，授權碼存在 Cloudflare 的環境變數，不會出現在前端
-    const API_URL = '/api/quake';
+    // 由 Netlify Function 代理，授權碼存在 Netlify 的環境變數，不會出現在前端
+    const API_URL = '/.netlify/functions/quake';
 
     const $ = (id) => document.getElementById(id);
 
